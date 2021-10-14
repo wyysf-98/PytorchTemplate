@@ -1,0 +1,17 @@
+_BASE_: [
+  '_base_/datasets/test.yaml',
+  '_base_/models/test.yaml',
+  '_base_/optimizers/test.yaml',
+  '_base_/default_runtime.yaml',
+]
+
+exp_name: 'test'
+
+dataloader:
+  cache: True
+
+# Loss
+loss:
+  img_loss:
+    type: 'MSE'
+    weight: 0.1

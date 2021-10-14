@@ -1,0 +1,10 @@
+output_dir: 'outputs'
+log_iter: 20 # frequence of log
+
+save_every_n_epoch: 100 # save ckpt every n epochs
+vis_step: False # vis in step mode, useful for large dataset
+vis_every_n_val: 1 # vis results every n valid steps
+vis_epoch: True
+vis_every_n_epoch: 25 # vis every n epochs
+
+

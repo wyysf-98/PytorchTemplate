@@ -22,53 +22,62 @@ def train(config):
     # create training clock
     clock = trainer.clock
 
-    trainer.val_loader = inf_loop(trainer.val_loader)
-    for e in range(clock.epoch, config['runtime']['num_epochs']):
-        # if use DDP mode, set train sampler every epoch
-        if trainer.dist:
-            trainer.train_sampler.set_epoch(e)
+    if config['val_mode'] == 'iter':
+        trainer.datas['val'] = inf_loop(trainer.datas['val'])
+    
+    for e in range(clock.epoch, config['num_epochs']):
         # save init state
         if e == 1:
             trainer.save_ckpt()
-            if config['trainer']['vis_epoch']:
+            try:
                 trainer.visualize_batch()
+            except Exception as ex:
+                print(f'WARNING: {ex}, do not support vis first epoch.')
                 
         # begin train iteration
-        train_pbar = tqdm(trainer.train_loader)
+        train_pbar = tqdm(trainer.datas['train'])
         for b, data in enumerate(train_pbar):
             # train step
             trainer.train_func(data)
-
-            # validation step
-            if clock.step % config['trainer']['val_every_n_step'] == 0:
-                data = next(trainer.val_loader)
-                trainer.val_func(data)
-                if config['trainer']['vis_step'] and \
-                    clock.step % (config['trainer']['vis_every_n_val'] * \
-                    config['trainer']['val_every_n_step']) == 0:
-                    trainer.visualize_batch()
-
             # set pbar
             train_pbar.set_description("Train EPOCH[{}][{}]".format(e, b))
             log_dict = {**trainer.losses, **trainer.extra}
-            train_pbar.set_postfix(OrderedDict({k: '%.4f'%v.item()
-                                        for k, v in log_dict.items()}))
+            train_pbar.set_postfix(OrderedDict({k: '%.4f'%v.item() for k, v in log_dict.items()}))
             # clock tick
             clock.tick()
-
+            # validation step
+            if config['val_mode'] == 'iter' and clock.step % config['val_every_n_iter'] == 0:
+                data = next(trainer.datas['val'])
+                trainer.val_func(data)
+                train_pbar.set_description("Val EPOCH[{}][{}]".format(e, b))
+                log_dict = {**trainer.losses, **trainer.extra}
+                train_pbar.set_postfix(OrderedDict({k: '%.4f'%v.item() for k, v in log_dict.items()}))
+                if clock.step % (config['vis_every_n_val'] * config['val_every_n_iter']) == 0:
+                    trainer.visualize_batch()
+      
         # update learning rate
         trainer.update_learning_rate()
         # clock tock
         clock.tock()
 
         # save checkpoint
-        if clock.epoch % config['trainer']['save_every_n_epoch'] == 0 or clock.epoch == 1:
+        if clock.epoch % config['save_every_n_epoch'] == 0:
             trainer.save_ckpt()
         trainer.save_ckpt('latest')  
 
-        # vis batch
-        if config['trainer']['vis_epoch'] and clock.epoch % config['trainer']['vis_every_n_epoch'] == 0:
-            trainer.visualize_batch()
+        # begin val iteration
+        if config['val_mode'] == 'epoch' and clock.epoch % config['val_every_n_epoch'] == 0:
+            val_pbar = tqdm(trainer.datas['val'])
+            for b, data in enumerate(val_pbar):
+                # val step
+                trainer.val_func(data)
+                # set pbar
+                val_pbar.set_description("Val EPOCH[{}][{}]".format(e, b))
+                log_dict = {**trainer.losses, **trainer.extra}
+                val_pbar.set_postfix(OrderedDict({k: '%.4f'%v.item() for k, v in log_dict.items()}))
+                # vis batch
+                if clock.epoch % (config['vis_every_n_val'] * config['val_every_n_epoch']) == 0:
+                    trainer.visualize_batch()
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 import os
 import os.path as osp
+from pathlib import Path
 import shutil
 import torch
 import torch.optim as optim
@@ -15,11 +16,12 @@ class BaseTrainer(object):
         All customized trainer should be subclass of this class.
     """
 
-    def __init__(self, config):
+    def __init__(self, cfg):
         """Init BaseTrainer Class."""
-        self.config = config
-        self.mode = config.mode
-        self.save_dir = config.save_dir
+        self.cfg = cfg
+        self.mode = cfg.mode
+        self.save_dir = cfg.save_dir
+        self.datas = dict()
         self.nets = dict()
         self.losses = dict()
         self.extra = dict()
@@ -31,23 +33,29 @@ class BaseTrainer(object):
         self.init_device()
 
         # init project, create local txt and tensorboard logger
-        self.init_project(config)
+        self.init_project(cfg)
 
         if self.mode is 'train' or self.mode is 'eval':
-            # save current codes
-            shutil.copytree(osp.dirname(osp.dirname(os.path.abspath(__file__))), self.save_dir / 'codes', \
-                ignore=shutil.ignore_patterns('data', 'outputs', '*.txt'))
+            if self.is_master:
+                # save current codes
+                shutil.copytree(Path(__file__).parent.parent, self.save_dir / 'codes', \
+                    ignore=shutil.ignore_patterns('data', 'outputs', '*.txt', '.*'))
             # get dataloader
-            self.prepare_dataloader(config['dataset'])
-            
+            self.prepare_dataloader(cfg['dataset'])
+
         # build network
-        self.build_model(config['model'])
+        self.build_model(cfg['model'])
 
         if self.mode is 'train':
             # set loss function
-            self.set_loss_function(config['loss'])
-            # configure optimizers
-            self.configure_optimizers(config['optimizer'])
+            self.set_loss_function(cfg['loss'])
+            # cfgure optimizers
+            self.cfgure_optimizers(cfg['optimizer'])
+
+        # prepare for accelerator
+        for m in [self.datas, self.nets, self.optimizers]:
+            for key in m.keys():
+                m[key] = self.accelerator.prepare(m[key])
 
     def master_process(func):
         """ decorator for master process """
@@ -57,17 +65,17 @@ class BaseTrainer(object):
         return wrapper
 
     @abstractmethod
-    def prepare_dataloader(self, data_config):
+    def prepare_dataloader(self, data_cfg):
         """prepare dataloader for training"""
         raise NotImplementedError
 
     @abstractmethod
-    def build_model(self, model_config):
+    def build_model(self, model_cfg):
         """build networks for training"""
         raise NotImplementedError
 
     @abstractmethod
-    def set_loss_function(self, loss_config):
+    def set_loss_function(self, loss_cfg):
         """set loss function used in training"""
         raise NotImplementedError
 
@@ -99,13 +107,13 @@ class BaseTrainer(object):
         self.local_rank = self.accelerator.process_index
 
     @master_process
-    def init_project(self, config):
+    def init_project(self, cfg):
         """Init project. Create log folder and txt/tensorboard logger."""
         os.makedirs(self.save_dir / 'log', exist_ok=True)
         # create txt logger
         self.logger = WorklogLogger(self.save_dir / 'log' / 'log.txt')
         self.logger.put_line(f'save to ======> {self.save_dir}')
-        self.record_str(config)
+        self.record_str(cfg)
 
         # set tensorboard writer
         self.tb = SummaryWriter(self.save_dir / 'log' / 'train.events')
@@ -118,10 +126,10 @@ class BaseTrainer(object):
         dict_recorded['total'] = sum(self.losses.values())
         for k, v in dict_recorded.items():
             record_str += '{}: {:.8f} '.format(k, v.item())
-            self.tb.add_scalar('{}_loss/{}'.format(prefix, k), v.item(), self.clock.step)
+            self.tb.add_scalar(f'{prefix}_loss/{k}', v.item(), self.clock.step)
         if not mute:
             self.logger.put_line(
-                '[Epoch/Step : {}/{}]: {}'.format(self.clock.epoch, self.clock.step, record_str))
+                f'[Epoch/Step : {self.clock.epoch}/{self.clock.step}]: {record_str}')
 
     @master_process
     def record_scalar(self, dict_recorded, prefix=None, mute=True):
@@ -129,27 +137,27 @@ class BaseTrainer(object):
         str_recorded = ''
         for k, v in dict_recorded.items():
             str_recorded += '{}: {:.8f} '.format(k, v.item())
-            self.tb.add_scalar(k if prefix is None else '{}/{}'.format(prefix, k), v.item(), self.clock.step)
+            self.tb.add_scalar(k if prefix is None else f'{prefix}/{k}', v.item(), self.clock.step)
         if not mute:
             self.logger.put_line(
-                '[Epoch/Step : {}/{}]: {}'.format(self.clock.epoch, self.clock.step, str_recorded))
+                f'[Epoch/Step : {self.clock.epoch}/{self.clock.step}]: {str_recorded}')
 
     @master_process
     def record_str(self, str_recorded):
         """record string in master process"""
         print(str_recorded)
         self.logger.put_line(
-            '[Epoch/Step : {}/{}]: {}'.format(self.clock.epoch, self.clock.step, str_recorded))
+            f'[Epoch/Step : {self.clock.epoch}/{self.clock.step}]: {str_recorded}')
     
     @master_process
     def save_ckpt(self, name=None):
         """save checkpoint during training for future restore"""
         if name is None:
             save_path = os.path.join(
-                self.save_dir, "epoch_{}.pth".format(self.clock.epoch))
-            print("Saving checkpoint epoch {}...".format(self.clock.epoch))
+                self.save_dir, f"epoch_{self.clock.epoch}.pth")
+            print(f"Saving checkpoint epoch {self.clock.epoch}...")
         else:
-            save_path = os.path.join(self.save_dir, "{}.pth".format(name))
+            save_path = os.path.join(self.save_dir, f"{name}.pth")
         
         save_dict = dict()
         save_dict['clock'] = self.clock.make_checkpoint()
@@ -161,16 +169,16 @@ class BaseTrainer(object):
         for key in self.optimizers.keys():
             save_dict[key+'_optimizer'] = self.optimizers[key].state_dict()
             save_dict[key+'_scheduler'] = self.schedulers[key].state_dict()
-        torch.save(save_dict, save_path)
+        self.accelerator.save(save_dict, save_path)
 
     def load_ckpt(self, name=None, restore_clock=True, restore_optimizer=True):
         """load checkpoint from saved checkpoint"""
-        load_path = name if str(name).endswith('.pth') else '{}.pth'.format(str(name))
+        load_path = name if str(name).endswith('.pth') else f'{name}.pth'
         if not os.path.exists(load_path):
-            raise ValueError("Checkpoint {} not exists.".format(load_path))
+            raise ValueError(f"Checkpoint {load_path} not exists.")
 
         checkpoint = torch.load(load_path, map_location=self.device)
-        print("Loading checkpoint from {} ...".format(load_path))
+        print(f"Loading checkpoint from {load_path} ...")
 
         for key in self.nets.keys():
             if isinstance(self.nets[key], DistributedDataParallel):
@@ -191,52 +199,51 @@ class BaseTrainer(object):
                     continue
                 self.schedulers[key].load_state_dict(checkpoint[key+'_scheduler'])
 
-    def get_optimizer(self, optimizer_config, parameters):
+    def get_optimizer(self, optimizer_cfg, parameters):
         """set optimizer used in training"""
         eps = 1e-8
-        if optimizer_config['type'] == 'sgd':
+        if optimizer_cfg['type'] == 'sgd':
             optimizer = optim.SGD(
-                parameters, lr=optimizer_config['lr'], momentum=optimizer_config['momentum'], weight_decay=optimizer_config['weight_decay'])
-        elif optimizer_config['type'] == 'adam':
+                parameters, lr=optimizer_cfg['lr'], momentum=optimizer_cfg['momentum'], weight_decay=optimizer_cfg['weight_decay'])
+        elif optimizer_cfg['type'] == 'adam':
             optimizer = optim.Adam(
-                parameters, lr=optimizer_config['lr'], eps=eps, weight_decay=optimizer_config['weight_decay'])
+                parameters, lr=optimizer_cfg['lr'], eps=eps, weight_decay=optimizer_cfg['weight_decay'])
         else:
-            raise NotImplementedError('Optimizer type {} not implemented yet !!!'.format(
-                optimizer_config['type']))
+            raise NotImplementedError(f'Optimizer type {optimizer_cfg.type} not implemented yet !!!')
 
         return optimizer
 
-    def get_scheduler(self, scheduler_config, optimizer):
+    def get_scheduler(self, scheduler_cfg, optimizer):
         """set lr scheduler used in training"""
         eps = 1e-8
-        if scheduler_config['type'] == 'steplr':
+        if scheduler_cfg['type'] == 'steplr':
             scheduler = lr_scheduler.MultiStepLR(
-                optimizer, milestones=scheduler_config['decay_step'], gamma=scheduler_config['decay_gamma'])
-        elif scheduler_config['type'] == 'explr':
+                optimizer, milestones=scheduler_cfg['decay_step'], gamma=scheduler_cfg['decay_gamma'])
+        elif scheduler_cfg['type'] == 'explr':
             scheduler = lr_scheduler.ExponentialLR(
-                optimizer, scheduler_config['lr_decay'])
-        elif scheduler_config['type'] == 'cosine':
+                optimizer, scheduler_cfg['lr_decay'])
+        elif scheduler_cfg['type'] == 'cosine':
             scheduler = lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=scheduler_config['num_epochs'], eta_min=eps)
-        elif scheduler_config['type'] == 'poly':
+                optimizer, T_max=scheduler_cfg['num_epochs'], eta_min=eps)
+        elif scheduler_cfg['type'] == 'poly':
             scheduler = lr_scheduler.LambdaLR(
-                optimizer, lambda epoch: (1-epoch/scheduler_config['num_epochs'])**scheduler_config['poly_exp'])
+                optimizer, lambda epoch: (1-epoch/scheduler_cfg['num_epochs'])**scheduler_cfg['poly_exp'])
         else:
-            raise NotImplementedError('Scheduler type {} not implemented yet !!!'.format(
-                scheduler_config['type']))
+            raise NotImplementedError(f'Scheduler type {scheduler_cfg.type} not implemented yet !!!')
         return scheduler
 
-    def configure_optimizers(self, optimizers_config):
-        """configure optimizers used in training"""
+    def cfgure_optimizers(self, optimizers_cfg):
+        """cfgure optimizers used in training"""
         parameters = []
         for key in self.nets.keys():
             parameters += list(self.nets[key].parameters())
 
-        optimizer = self.get_optimizer(optimizers_config, parameters)
-        scheduler = self.get_scheduler(optimizers_config['scheduler'], optimizer)
-
+        optimizer = self.get_optimizer(optimizers_cfg, parameters)
         self.optimizers['base'] = optimizer
-        self.schedulers['base'] = scheduler
+
+        if optimizers_cfg['scheduler'] is not None:
+            scheduler = self.get_scheduler(optimizers_cfg['scheduler'], optimizer)
+            self.schedulers['base'] = scheduler
 
     def update_learning_rate(self):
         """record and update learning rate"""
@@ -246,9 +253,9 @@ class BaseTrainer(object):
         for key in self.optimizers.keys():
             if self.is_master:
                 current_lr = get_learning_rate(self.optimizers[key])
-                self.logger.put_line('[Epoch/Step : {}/{}]: <optimizer {}> learning rate is: {}'.format(
-                    self.clock.epoch, self.clock.step, key, current_lr))
-                self.tb.add_scalar('learning_rate/{}_lr'.format(key), current_lr, self.clock.epoch)
+                self.logger.put_line(\
+                    f'[Epoch/Step : {self.clock.epoch}/{self.clock.step}]: <optimizer {key}> learning rate is: {current_lr}')
+                self.tb.add_scalar(f'learning_rate/{key}_lr', current_lr, self.clock.epoch)
 
             self.schedulers[key].step()
 
@@ -258,27 +265,43 @@ class BaseTrainer(object):
             self.optimizers[key].zero_grad()
 
         total_loss = sum(self.losses.values())
-        total_loss.backward()
+        self.accelerator.backward(total_loss)
 
         for key in self.optimizers.keys():
             self.optimizers[key].step()
 
+    def set_network(self, mode='train'):
+        """set networks to train/eval mode"""
+        for key in self.nets.keys():
+            if mode is 'train':
+                if isinstance(self.nets[key], DistributedDataParallel):
+                    self.nets[key] = self.nets[key].module.train()
+                else:
+                    self.nets[key] = self.nets[key].train()
+            elif mode is 'eval':
+                if isinstance(self.nets[key], DistributedDataParallel):
+                    self.nets[key] = self.nets[key].module.eval()
+                else:
+                    self.nets[key] = self.nets[key].eval()
+            else:
+                raise ValueError(f'Networks mode: {mode} not support !!!')
+
     def train_func(self, data):
         """training function"""
-        self.train_mode()
+        self.set_network('train')
 
         self.train_step(data)
         self.update_network()
 
-        if self.clock.step % self.config['runtime']['log_iter']==0:
+        if self.clock.step % self.cfg['log_iter']==0:
             self.record_losses('train')
 
     def val_func(self, data):
         """validation function"""
-        self.eval_mode()
+        self.set_network('eval')
 
         with torch.no_grad():
             self.val_step(data)
 
-        if self.clock.step % self.config['runtime']['log_iter']==0:
+        if self.clock.step % self.cfg['log_iter']==0:
             self.record_losses('valid')
